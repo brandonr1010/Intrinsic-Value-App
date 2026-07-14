@@ -14,8 +14,7 @@ Env vars (set in Railway):
   CACHE_TTL     seconds to cache a ticker (default 43200 = 12h)
 
 STATUS: logic-complete, UNTESTED against live FMP (no key/network here).
-Verify field names against your FMP plan before shipping — FMP is
-migrating from /api/v3 to /stable and some fields differ by tier.
+Verify field names against your FMP plan before shipping — Uses FMP /stable API (v3 legacy returns 403 for new accounts).
 """
 
 import os
@@ -26,13 +25,13 @@ from flask import Flask, jsonify
 app = Flask(__name__)
 
 FMP_KEY = os.environ.get("FMP_API_KEY", "")
-BASE = "https://financialmodelingprep.com/api/v3"
+BASE = "https://financialmodelingprep.com/stable"
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "43200"))
 _cache = {}  # {ticker: (timestamp, payload)}
 
 
 def _get(path):
-    """One FMP GET. Raises on non-200 or empty."""
+    """One FMP GET (stable API). Raises on non-200 or empty."""
     url = f"{BASE}/{path}"
     sep = "&" if "?" in path else "?"
     r = requests.get(f"{url}{sep}apikey={FMP_KEY}", timeout=10)
@@ -53,10 +52,10 @@ def fetch_inputs(ticker):
     (and you) can trace it. Values in millions where noted."""
     t = ticker.upper()
 
-    quote = _first(_get(f"quote/{t}"))                       # price, eps, shares, mktCap
-    income = _first(_get(f"income-statement/{t}?limit=1"))   # ebitda, eps
-    cash = _first(_get(f"cash-flow-statement/{t}?limit=1"))  # freeCashFlow
-    bal = _first(_get(f"balance-sheet-statement/{t}?limit=1"))  # debt, cash
+    quote = _first(_get(f"quote?symbol={t}"))                       # price, eps, shares, mktCap
+    income = _first(_get(f"income-statement?symbol={t}&limit=1"))   # ebitda, eps
+    cash = _first(_get(f"cash-flow-statement?symbol={t}&limit=1"))  # freeCashFlow
+    bal = _first(_get(f"balance-sheet-statement?symbol={t}&limit=1"))  # debt, cash
 
     total_debt = bal.get("totalDebt") or 0
     cash_sti = (bal.get("cashAndShortTermInvestments")
@@ -64,15 +63,20 @@ def fetch_inputs(ticker):
     net_debt = total_debt - cash_sti
 
     MM = 1e6  # convert absolute dollars -> $M to match the model's scale
+    # stable /quote trimmed some fields vs legacy v3 — fall back to income stmt
+    shares = (quote.get("sharesOutstanding")
+              or income.get("weightedAverageShsOutDil")
+              or income.get("weightedAverageShsOut") or 0)
+    eps = quote.get("eps") or income.get("epsDiluted") or income.get("eps")
     return {
         "ticker": t,
         "companyName": quote.get("name"),
         "asOf": income.get("date"),
         "currency": income.get("reportedCurrency", "USD"),
-        # --- price & share data (source: /quote) ---
+        # --- price & share data (source: /quote, fallback income stmt) ---
         "price": quote.get("price"),
-        "sharesM": (quote.get("sharesOutstanding") or 0) / MM,
-        "epsTTM": quote.get("eps"),
+        "sharesM": shares / MM,
+        "epsTTM": eps,
         # --- DCF drivers ---
         "fcf0M": (cash.get("freeCashFlow") or 0) / MM,       # source: cash-flow.freeCashFlow
         "ebitdaM": (income.get("ebitda") or 0) / MM,          # source: income.ebitda
