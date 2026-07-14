@@ -97,6 +97,34 @@ def health():
     return jsonify(ok=True, hasKey=bool(FMP_KEY))
 
 
+@app.route("/search/<query>")
+def search(query):
+    """Ticker/company-name search for autocomplete. Returns up to 8 matches."""
+    if not FMP_KEY:
+        return jsonify(error="server missing FMP_API_KEY"), 503
+    q = query.strip()
+    if len(q) < 1:
+        return jsonify(results=[])
+    try:
+        data = _get(f"search-symbol?query={q}&limit=8")
+    except Exception:
+        # fall back to name search if symbol search fails/empty
+        try:
+            data = _get(f"search-name?query={q}&limit=8")
+        except Exception as e:
+            return jsonify(error=str(e), results=[]), 502
+    results = [
+        {
+            "symbol": d.get("symbol"),
+            "name": d.get("name"),
+            "exchange": d.get("exchangeFullName") or d.get("exchange"),
+            "currency": d.get("currency"),
+        }
+        for d in (data if isinstance(data, list) else [])
+    ]
+    return jsonify(results=results)
+
+
 @app.route("/inputs/<ticker>")
 def inputs(ticker):
     if not FMP_KEY:
