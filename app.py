@@ -40,13 +40,15 @@ from datetime import datetime, timedelta, timezone
 import requests
 from flask import Flask, jsonify, request
 
+import edgar
+
 try:
     from zoneinfo import ZoneInfo
     _ET = ZoneInfo("America/New_York")
 except Exception:  # pragma: no cover
     _ET = timezone(timedelta(hours=-5))
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 app = Flask(__name__)
 
 FMP_KEY = os.environ.get("FMP_API_KEY", "")
@@ -60,6 +62,8 @@ FREE_UNIVERSE = [s.strip().upper() for s in os.environ.get(
     "FREE_UNIVERSE", "WMT,AAPL,MSFT,KO,NKE,XOM,DIS,BAC,JPM").split(",") if s.strip()]
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 MM = 1e6
+DATA_SOURCE = os.environ.get("DATA_SOURCE", "fmp").lower()   # "edgar" or "fmp" — fundamentals provider
+FINNHUB_KEY = os.environ.get("FINNHUB_KEY", "")                # optional price source (preferred when set)
 SYM_RE = re.compile(r"^[A-Z0-9.\-^]{1,15}$")
 
 # ---------------------------------------------------------------- caches
@@ -188,7 +192,9 @@ def get_quote(sym):
     if fresh:
         return {**cached, "_cached": True}
     try:
-        q = _first(_get("quote", symbol=sym))
+        q = _finnhub_quote(sym) if FINNHUB_KEY else None
+        if q is None:
+            q = _first(_get("quote", symbol=sym))
     except ProviderError:
         if cached:
             return {**cached, "_cached": True, "_stale": True}
@@ -211,6 +217,40 @@ def get_quote(sym):
     }
     _cache_put(("q", sym), payload)
     return {**payload, "_cached": False}
+
+
+def _finnhub_quote(sym):
+    """Finnhub /quote -> FMP-shaped dict, or None if Finnhub has nothing (caller falls back)."""
+    try:
+        r = requests.get("https://finnhub.io/api/v1/quote", params={"symbol": sym, "token": FINNHUB_KEY}, timeout=8)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+    except (requests.RequestException, ValueError):
+        return None
+    c = _num(j.get("c"))
+    if not c:
+        return None
+    return {"price": c, "previousClose": _num(j.get("pc")), "timestamp": j.get("t"), "_src": "finnhub"}
+
+
+# ---------------------------------------------------------------- FX (for non-USD reporters, e.g. 40-F filers in CAD)
+def fx_to_usd(ccy):
+    """Latest ECB reference rate via Frankfurter (free, no key). Cached 12h. None if unavailable."""
+    if not ccy or ccy == "USD":
+        return 1.0
+    cached, fresh = _cache_get(("fx", ccy), 43200)
+    if fresh:
+        return cached
+    try:
+        r = requests.get("https://api.frankfurter.app/latest", params={"from": ccy, "to": "USD"}, timeout=8)
+        rate = _num(r.json().get("rates", {}).get("USD")) if r.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        rate = None
+    if rate:
+        _cache_put(("fx", ccy), rate)
+        return rate
+    return cached
 
 
 # ---------------------------------------------------------------- fundamentals
@@ -311,15 +351,23 @@ def fetch_fundamentals(sym):
     }
 
 
-def get_inputs(sym):
-    cached, fresh = _cache_get(("f", sym), FUND_TTL)
+def _fetch_edgar(sym):
+    try:
+        return edgar.fundamentals(sym)
+    except edgar.EdgarError as e:
+        raise ProviderError(e.kind, e.status) from None
+
+
+def get_inputs(sym, source=None):
+    source = (source or DATA_SOURCE).lower()
+    cached, fresh = _cache_get(("f", source, sym), FUND_TTL)
     stale = False
     if fresh:
         fund = cached
     else:
         try:
-            fund = fetch_fundamentals(sym)
-            _cache_put(("f", sym), fund)
+            fund = _fetch_edgar(sym) if source == "edgar" else fetch_fundamentals(sym)
+            _cache_put(("f", source, sym), fund)
         except ProviderError:
             if not cached:
                 raise
@@ -330,9 +378,11 @@ def get_inputs(sym):
 
     price = q["price"]
     src = dict(fund["_sources"])
-    src["price"] = "quote.price"
-    # current share count: market cap / price (reflects buybacks), else FY weighted diluted
-    if q.get("marketCapM") and price:
+    src["price"] = "finnhub.quote" if FINNHUB_KEY and not q.get("marketCapM") else "quote.price"
+    # share count: SEC cover-page count when on EDGAR; else market cap / price; else FY weighted diluted
+    if fund.get("_edgarSharesM"):
+        shares = fund["_edgarSharesM"]
+    elif q.get("marketCapM") and price:
         shares = q["marketCapM"] / price
         src["sharesM"] = "quote.marketCap / quote.price"
     else:
@@ -340,6 +390,18 @@ def get_inputs(sym):
         src["sharesM"] = f"income-statement.weightedAverageShsOutDil (FY {fund.get('asOf')})"
 
     out = {k: v for k, v in fund.items() if not k.startswith("_")}
+    # convert non-USD statements so they match the USD share price
+    rc = fund.get("reportedCurrency")
+    if rc and rc != "USD":
+        rate = fx_to_usd(rc)
+        if rate:
+            for k in ("epsTTM", "fcf0M", "ebitdaM", "netDebtM", "revenueM"):
+                if out.get(k) is not None:
+                    out[k] = out[k] * rate
+            src["fx"] = f"{rc}->USD {rate:.4f} (ECB via frankfurter.app)"
+        else:
+            out["fxMissing"] = True
+    out["dataSource"] = fund.get("_source", "fmp")
     out.update({
         "price": price,
         "prevClose": q.get("prevClose"),
@@ -408,6 +470,7 @@ def _guard():
 @app.route("/health")
 def health():
     return jsonify(ok=True, version=VERSION, hasKey=bool(FMP_KEY), marketOpen=market_open(),
+                   dataSource=DATA_SOURCE, priceSource="finnhub" if FINNHUB_KEY else "fmp",
                    callsToday=_budget["used"] if _budget["day"] else 0, dailyBudget=DAILY_BUDGET,
                    planLockedEndpoints=sorted(_unavailable), cached=len(_cache))
 
@@ -441,7 +504,7 @@ def inputs(sym):
     if (g := _guard()):
         return g
     try:
-        return jsonify(get_inputs(_clean_sym(sym)))
+        return jsonify(get_inputs(_clean_sym(sym), request.args.get("src")))
     except ProviderError as e:
         return jsonify(error=e.kind, ticker=sym.upper()), e.status
 
@@ -453,7 +516,7 @@ def universe():
     out, errors = {}, {}
     for s in FREE_UNIVERSE:
         try:
-            out[s] = get_inputs(s)
+            out[s] = get_inputs(s, request.args.get("src"))
         except ProviderError as e:
             errors[s] = e.kind
     return jsonify(tickers=FREE_UNIVERSE, data=out, errors=errors, marketOpen=market_open())
@@ -473,6 +536,20 @@ def history(sym):
         return _err(e)
 
 
+@app.route("/compare/<sym>")
+def compare(sym):
+    """Side-by-side EDGAR vs FMP bundle — used to validate the EDGAR mapping."""
+    if (g := _guard()):
+        return g
+    out = {}
+    for source in ("edgar", "fmp"):
+        try:
+            out[source] = get_inputs(_clean_sym(sym), source)
+        except ProviderError as e:
+            out[source] = {"error": e.kind}
+    return jsonify(out)
+
+
 @app.route("/search/<query>")
 def search(query):
     """Ticker/company-name search for autocomplete. Returns up to 8 matches."""
@@ -481,6 +558,11 @@ def search(query):
     q = query.strip()[:40]
     if not q:
         return jsonify(results=[])
+    if DATA_SOURCE == "edgar" or request.args.get("src") == "edgar":
+        try:
+            return jsonify(results=edgar.search(q))
+        except edgar.EdgarError as e:
+            return jsonify(error=e.kind, results=[]), e.status
     cached, fresh = _cache_get(("s", q.lower()), FUND_TTL)
     if fresh:
         return jsonify(results=cached)
